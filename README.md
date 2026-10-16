@@ -126,6 +126,7 @@ recisdb tune -i /dev/dvb/adapter0/frontend0 -c BS15_0 -t 30 out.ts
 | `s_acquire_retries` | `1` | キャリアがロックしないときにISDB-SのPLLと捕捉をリトライする回数 |
 | `pkt_num`, `n_dmabuf` | — | DMAリングのチューニング |
 | `adapter_nr` | 未設定 | DVBアダプタ番号の固定。登録順はS0、S1、T0、T1。例: `adapter_nr=2,3,0,1`でISDB-Tがadapter0/1になる |
+| `lna_gain` | `middle` | 地デジチューナー（FC0012）のLNAゲイン。`low`、`middle`、`high`のいずれか。T0、T1の順にカンマ区切りで個別に指定できる（例: `lna_gain=middle,high`）。1つだけ書くと両方に適用。モジュールのロード時にだけ反映される。受信レベルが高い環境では`high`だと過入力になりやすい（docs/MEASUREMENTS.md） |
 
 ## 注意事項
 
