@@ -383,6 +383,47 @@ MODULE_PARM_DESC(regmap,
 		 "BAR register layout: -1 = auto-detect (default), 0 = standard (Rev1.3), 1 = alternate (Rev1.2)");
 
 /*
+ * FC0012 LNA gain (reg 0x13) for each ISDB-T tuner, in the order T0,T1 (the
+ * order the ISDB-T adapters are registered), e.g. lna_gain=middle,high. One
+ * value applies to both tuners. The three settings are the values named in
+ * mainline drivers/media/tuners/fc0012.c fc0012_init() ("Set to Middle Gain:
+ * 0x08, Low Gain: 0x00, High Gain: 0x10"). Applied at probe only.
+ */
+static char *lna_gain[2];
+static int n_lna_gain;
+module_param_array(lna_gain, charp, &n_lna_gain, 0444);
+MODULE_PARM_DESC(lna_gain,
+		 "FC0012 LNA gain per ISDB-T tuner T0,T1: low, middle (default) or high");
+
+struct fc0012_lna_gain {
+	const char *name;
+	u8 reg;
+};
+
+static const struct fc0012_lna_gain fc0012_lna_gains[] = {
+	{ "low",    0x00 },
+	{ "middle", 0x08 },
+	{ "high",   0x10 },
+};
+
+static const struct fc0012_lna_gain *fc0012_lna_gain(struct pxw3pe *p, int tuner)
+{
+	const struct fc0012_lna_gain *def = &fc0012_lna_gains[1];
+	const char *s;
+	int i;
+
+	if (n_lna_gain == 0)
+		return def;
+	s = lna_gain[n_lna_gain == 1 ? 0 : tuner];
+	for (i = 0; i < ARRAY_SIZE(fc0012_lna_gains); i++)
+		if (sysfs_streq(s, fc0012_lna_gains[i].name))
+			return &fc0012_lna_gains[i];
+	dev_warn(&p->pdev->dev, "lna_gain '%s' for T%d not recognised, using %s\n",
+		 s, tuner, def->name);
+	return def;
+}
+
+/*
  * Firmware blob layout (PXW3PE_FW_NAME): 4-byte magic "PXWF", 1-byte version,
  * 3 reserved, then the per-model secrets. The operator builds this from their
  * own device; this source ships none of the byte values.
@@ -1121,7 +1162,7 @@ static const u8 demod_t_init[][2] = {
 	{0xb8, 0xff}, {0x22, 0x8f}, {0x5f, 0x80}, {0xef, 0x01},
 };
 
-static void fc0012_init_regs(struct pxw3pe *p, u8 taddr);
+static void fc0012_init_regs(struct pxw3pe *p, u8 taddr, int tuner);
 
 static int demod_write_table(struct pxw3pe *p, u8 addr,
 			     const u8 tbl[][2], size_t n)
@@ -1172,8 +1213,8 @@ static int tc905xx_initialise_all(struct pxw3pe *p)
 			return ret;
 	}
 
-	fc0012_init_regs(p, DEMOD_T0);
-	fc0012_init_regs(p, DEMOD_T1);
+	fc0012_init_regs(p, DEMOD_T0, 0);
+	fc0012_init_regs(p, DEMOD_T1, 1);
 
 	for (i = 0; i < ARRAY_SIZE(saddrs); i++) {
 		ret = demod_wr_reg(p, saddrs[i], 0x17, 0x00);
@@ -1688,18 +1729,22 @@ static void fc_rmw(struct pxw3pe *p, u8 taddr, u8 reg, u8 set, u8 clr)
  * (High), which overloads the front end: on a Rev1.3 card with a normal home
  * antenna feed, C/N rose from 17.8-19.1 dB to 26.9-29.0 dB on every UHF channel
  * and 50-650 lost packets per 10 s on 21-24ch went to zero (docs/MEASUREMENTS.md).
+ * The lna_gain parameter can select one of the other two mainline values.
  */
-static void fc0012_init_regs(struct pxw3pe *p, u8 taddr)
+static void fc0012_init_regs(struct pxw3pe *p, u8 taddr, int tuner)
 {
 	static const u8 regs[] = {
 		0x00, 0x05, 0x10, 0x00, 0x00, 0x0f, 0x00, 0x00,
 		0xff, 0x6e, 0xb8, 0x82, 0xf8, 0x02, 0x00, 0x00,
 		0x00, 0x00, 0x1b, 0x08, 0x00, 0x04,
 	};
+	const struct fc0012_lna_gain *g = fc0012_lna_gain(p, tuner);
 	int i;
 
 	for (i = 1; i < ARRAY_SIZE(regs); i++)
-		fc_wr(p, taddr, i, regs[i]);
+		fc_wr(p, taddr, i, i == 0x13 ? g->reg : regs[i]);
+	dev_info(&p->pdev->dev, "T%d FC0012 LNA gain %s (reg 0x13 = 0x%02x)\n",
+		 tuner, g->name, g->reg);
 
 	/* Official InitRFDevice toggles FC0012 reg0x10 after the base table. */
 	fc_wr(p, taddr, 0x10, 0x00);
