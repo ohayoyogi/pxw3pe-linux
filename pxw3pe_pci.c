@@ -2681,6 +2681,28 @@ static int pxw3pe_t_tune(struct dvb_frontend *fe, bool retune,
 	return pxw3pe_t_read_status(fe, status);
 }
 
+/*
+ * Park the FC0012 when the frontend is closed. The FC0012 has no sleep op
+ * (none in mainline drivers/media/tuners/fc0012.c either) and keeps its LO
+ * running at the last channel. It is a zero-IF tuner, so that LO sits in the
+ * middle of the channel; when the other ISDB-T tuner is then tuned to the same
+ * channel, it often comes up at ~17 dB C/N with no TS (15 of 30 tunes on 19ch
+ * on a Rev1.3 card, 0 of 30 with this change; docs/MEASUREMENTS.md). Run the
+ * same set-frequency sequence as at probe, at the same 773143 kHz, which is
+ * above the UHF band [w3pe pxw3pe_hw_init()].
+ */
+static int pxw3pe_t_sleep(struct dvb_frontend *fe)
+{
+	struct pxw3pe_adap *a = container_of(fe, struct pxw3pe_adap, fe);
+	struct pxw3pe *p = a->card;
+	int chip = chip_of(a->demod);
+
+	mutex_lock(&p->chip_lock[chip]);
+	isdbt_set_frequency(p, a->demod, 0xbcc17);
+	mutex_unlock(&p->chip_lock[chip]);
+	return 0;
+}
+
 static const struct dvb_frontend_ops pxw3pe_isdbt_ops = {
 	.delsys = { SYS_ISDBT },
 	.info = {
@@ -2695,6 +2717,7 @@ static const struct dvb_frontend_ops pxw3pe_isdbt_ops = {
 	.release		= pxw3pe_fe_release,
 	.get_frontend_algo	= pxw3pe_get_algo,
 	.tune			= pxw3pe_t_tune,
+	.sleep			= pxw3pe_t_sleep,
 	.read_status		= pxw3pe_t_read_status,
 	.read_snr		= pxw3pe_t_read_snr,
 };
