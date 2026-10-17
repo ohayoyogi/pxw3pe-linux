@@ -74,6 +74,7 @@
 #define TS_TAG_SAT	0x47
 #define TS_TAG_TER	0xc7
 #define PKT_NUM_MIN	312			/* clamp floor for the pkt_num param */
+#define PXW3PE_START_SKIP 312			/* packets dropped after arming a port */
 #define NR_PORT		2
 #define NR_CH		2
 #define NR_ADAP		(NR_PORT * NR_CH)	/* S0/S1/T0/T1 */
@@ -269,6 +270,14 @@ struct pxw3pe {
 	int		nbuf;		/* ping-pong buffers per channel */
 	bool		dma_ch_on[NR_PORT][NR_CH];
 	u8		dma_cur[NR_PORT][NR_CH];	/* ping-pong buffer idx */
+	/*
+	 * Packets to drop at the start of a port's stream: the bridge still
+	 * holds packets from before the port was armed. Measured on a Rev1.3
+	 * (ISDB-T, both tuners): CC gaps within the first 5..61 packets of a
+	 * capture, intermittently, and none afterwards. Consumed by the bottom
+	 * half only (dma_dispatch).
+	 */
+	u32		start_skip[NR_PORT];
 	spinlock_t	reg_lock;	/* serialize DMA mgmt RMW vs ISR */
 	/* IRQ top-half -> threaded bottom-half handoff: filled DMA buffers to
 	 * dispatch + copy outside the hardirq. Produced under reg_lock by the top
@@ -358,6 +367,15 @@ static bool descramble = true;
 module_param(descramble, bool, 0644);
 MODULE_PARM_DESC(descramble,
 		 "Apply ASV5606 transport DES descramble when key firmware is present (default on)");
+
+/*
+ * Fixed DVB adapter numbers, e.g. adapter_nr=2,3,0,1. Adapters are registered
+ * in the order S0, S1, T0, T1, and each takes the first free number in this
+ * list (dvb_register_adapter()); unset entries mean "next free number".
+ * Without it the numbers depend on probe order and other DVB devices, which
+ * breaks the /dev/dvb/adapterN paths in Mirakurun's tuners.yml.
+ */
+DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
 
 static int regmap = -1;
 module_param(regmap, int, 0444);
@@ -1576,7 +1594,8 @@ static u32 cn_raw_to_cdb(u32 raw, const u32 *tbl)
 	for (i = 3; i <= 30; i++) {
 		if (raw > tbl[i]) {
 			u32 span = tbl[i - 1] - tbl[i];
-			u32 frac = span ? (10 * (tbl[i - 1] - raw)) / span : 0;
+			/* fractional part in 0.01 dB (was scaled by 10 only) */
+			u32 frac = span ? (100 * (tbl[i - 1] - raw)) / span : 0;
 
 			return (i - 1) * 100 + frac;
 		}
@@ -1663,13 +1682,19 @@ static void fc_rmw(struct pxw3pe *p, u8 taddr, u8 reg, u8 set, u8 clr)
 /* FC0012 base register init (mainline fc0012.c init table,
  * regs 0x01..0x15). Mandatory once per tuner — without it the VCO
  * auto-calibration rails and the PLL never locks at low UHF.
+ *
+ * reg 0x13 (LNA gain) is 0x08 = Middle, as in mainline fc0012_init() ("Set to
+ * Middle Gain: 0x08, Low Gain: 0x00, High Gain: 0x10"). It used to be 0x10
+ * (High), which overloads the front end: on a Rev1.3 card with a normal home
+ * antenna feed, C/N rose from 17.8-19.1 dB to 26.9-29.0 dB on every UHF channel
+ * and 50-650 lost packets per 10 s on 21-24ch went to zero (docs/MEASUREMENTS.md).
  */
 static void fc0012_init_regs(struct pxw3pe *p, u8 taddr)
 {
 	static const u8 regs[] = {
 		0x00, 0x05, 0x10, 0x00, 0x00, 0x0f, 0x00, 0x00,
 		0xff, 0x6e, 0xb8, 0x82, 0xf8, 0x02, 0x00, 0x00,
-		0x00, 0x00, 0x1b, 0x10, 0x00, 0x04,
+		0x00, 0x00, 0x1b, 0x08, 0x00, 0x04,
 	};
 	int i;
 
@@ -2007,6 +2032,8 @@ static int dma_chan_start(struct pxw3pe *p, int port, int ch)
 		u32 mgmt;
 
 		p->dma_cur[port][ch] = 0;
+		if (ch == 0)
+			p->start_skip[port] = PXW3PE_START_SKIP;
 		p->c_full[port][ch] = p->c_skip[port][ch] = 0;
 		p->c_tag_sat[port][ch] = p->c_tag_ter[port][ch] = 0;
 		mgmt = readl(bar + dma_mgmt_off(p, port));
@@ -2165,6 +2192,14 @@ static void dma_dispatch(struct pxw3pe *p, int port, int ch,
 	struct pxw3pe_adap *run_a = NULL;
 	u32 off, run_off = 0;
 
+	if (p->start_skip[port]) {	/* stale packets from before arming */
+		u32 n = min(p->start_skip[port], len / TS_SIZE);
+
+		p->start_skip[port] -= n;
+		buf += n * TS_SIZE;
+		len -= n * TS_SIZE;
+	}
+
 	for (off = 0; off + TS_SIZE <= len; off += TS_SIZE) {
 		u8 tag = buf[off];
 		struct pxw3pe_adap *a = adap_by_tag(p, port, tag);
@@ -2305,7 +2340,9 @@ static irqreturn_t pxw3pe_irq_thread(int irq, void *dev)
  *
  * The 184-byte payload is exactly 23 DES blocks; the first 16 (bytes 4..131)
  * use the even key, the last 7 (bytes 132..187) the odd key. The 4-byte TS
- * header is left untouched.
+ * header is left untouched, including transport_error_indicator: it is the
+ * demodulator's uncorrectable-error flag, which downstream (libaribb25,
+ * Mirakurun, drop checkers) relies on.
  */
 static void ts_process(u8 *buf, u32 len)
 {
@@ -2330,7 +2367,6 @@ static void ts_process(u8 *buf, u32 len)
 				des_decrypt(k, blk, blk);
 			}
 		}
-		pkt[1] &= 0x7f;			/* clear error indicator  */
 	}
 }
 
@@ -2964,7 +3000,6 @@ static int pxw3pe_dvb_init(struct pxw3pe *p)
 
 	for (i = 0; i < NR_ADAP; i++) {
 		struct pxw3pe_adap *a = &p->adap[i];
-		short adapter_nr[] = { -1 };
 
 		a->card    = p;
 		a->demod   = map[i].demod;
