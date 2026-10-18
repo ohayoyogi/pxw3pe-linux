@@ -3033,16 +3033,20 @@ static void pxw3pe_dvb_exit(struct pxw3pe *p)
 	for (i = NR_ADAP - 1; i >= 0; i--) {
 		struct pxw3pe_adap *a = &p->adap[i];
 
+		/*
+		 * The consumer thread feeds a->demux (dvb_dmx_swfilter), so stop
+		 * it before the demux is released.
+		 */
+		if (a->thread) {
+			kthread_stop(a->thread);
+			a->thread = NULL;
+		}
 		if (a->dvb_ready) {
 			dvb_unregister_frontend(&a->fe);
 			dvb_dmxdev_release(&a->dmxdev);
 			dvb_dmx_release(&a->demux);
 			dvb_unregister_adapter(&a->dvb);
 			a->dvb_ready = false;
-		}
-		if (a->thread) {
-			kthread_stop(a->thread);
-			a->thread = NULL;
 		}
 		vfree(a->sbuf);
 		a->sbuf = NULL;
